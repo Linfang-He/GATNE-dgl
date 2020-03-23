@@ -32,29 +32,21 @@ def get_graphs(layers, index2word, neighbors):
 
 # train_pairs: size: 452200, form: (node1, node2, layer_id)
 # neighbors: [num_nodes=511, 2, 10]
-def get_batches(pairs, neighbors):
-    x, y, t, neigh = [], [], [], []
-    for pair in pairs:
-        x.append(pair[0])
-        y.append(pair[1])
-        t.append(pair[2])
-        neigh.append(neighbors[pair[0]])
-    return torch.tensor(x), torch.tensor(y), torch.tensor(t), torch.tensor(neigh)
 
-# def get_batches(pairs, neighbors, batch_size):
-#     n_batches = (len(pairs) + (batch_size - 1)) // batch_size
+def get_batches(pairs, neighbors, batch_size):
+    n_batches = (len(pairs) + (batch_size - 1)) // batch_size
 
-#     for idx in range(n_batches):
-#         x, y, t, neigh = [], [], [], []
-#         for i in range(batch_size):
-#             index = idx * batch_size + i
-#             if index >= len(pairs):
-#                 break
-#             x.append(pairs[index][0])
-#             y.append(pairs[index][1])
-#             t.append(pairs[index][2])
-#             neigh.append(neighbors[pairs[index][0]])
-#         yield torch.tensor(x), torch.tensor(y), torch.tensor(t), torch.tensor(neigh)
+    for idx in range(n_batches):
+        x, y, t, neigh = [], [], [], []
+        for i in range(batch_size):
+            index = idx * batch_size + i
+            if index >= len(pairs):
+                break
+            x.append(pairs[index][0])
+            y.append(pairs[index][1])
+            t.append(pairs[index][2])
+            neigh.append(neighbors[pairs[index][0]])
+        yield torch.tensor(x), torch.tensor(y), torch.tensor(t), torch.tensor(neigh)
 
 
 class DGLGATNE(nn.Module):
@@ -70,11 +62,12 @@ class DGLGATNE(nn.Module):
         self.embedding_u_size = embedding_u_size
         self.edge_type_count = edge_type_count
         self.dim_a = dim_a
-        
-        for g in self.graphs:
-            g.ndata['node_type_embeddings'] = -2 * torch.rand(num_nodes, embedding_u_size) + 1
 
         self.node_embeddings = Parameter(torch.FloatTensor(num_nodes, embedding_size))
+        # edge embedding, 511 * 2 * 10
+        self.node_type_embeddings = Parameter(  
+            torch.FloatTensor(num_nodes, edge_type_count, embedding_u_size)
+        )
         self.trans_weights = Parameter(
             torch.FloatTensor(edge_type_count, embedding_u_size, embedding_size)
         )
@@ -87,6 +80,7 @@ class DGLGATNE(nn.Module):
 
     def reset_parameters(self):
         self.node_embeddings.data.uniform_(-1.0, 1.0)
+        self.node_type_embeddings.data.uniform_(-1.0, 1.0)
         self.trans_weights.data.normal_(std=1.0 / math.sqrt(self.embedding_size))
         self.trans_weights_s1.data.normal_(std=1.0 / math.sqrt(self.embedding_size))
         self.trans_weights_s2.data.normal_(std=1.0 / math.sqrt(self.embedding_size))
@@ -94,36 +88,45 @@ class DGLGATNE(nn.Module):
     # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10
     # embs: [batch_size64, embedding_size200]
     # embs = model(data[0].to(device), data[2].to(device), data[3].to(device))
-    def forward(self, train_inputs=None, train_types=None, node_neigh=None, subgraph=False):
-        graphs = self.graphs
-        if subgraph == True:
-            tmp_graphs = []
-            for layer in range(len(graphs)):
-                edges = graphs[layer].edge_ids(train_inputs[0], node_neigh[0][layer])
-                for node in range(1, train_inputs.shape[0]):
-                    e = graphs[layer].edge_ids(train_inputs[node], node_neigh[node][layer])
-                    edges = torch.cat([edges, e], dim = 0)
-                graph = graphs[layer].edge_subgraph(edges, preserve_nodes=True)
-                graph.ndata['node_type_embeddings'] = graphs[layer].ndata['node_type_embeddings']
-                tmp_graphs.append(graph)
-            graphs = tmp_graphs
-
+    def forward(self, train_inputs, train_types, node_neigh):
+        for g in self.graphs:
+            g.ndata['node_type_embeddings'] = self.node_type_embeddings
+            
+        sub_graphs = []
+        for layer in range(self.edge_type_count):
+            edges = self.graphs[layer].edge_ids(train_inputs[0], node_neigh[0][layer])
+            for node in range(1, train_inputs.shape[0]):
+                e = self.graphs[layer].edge_ids(train_inputs[node], node_neigh[node][layer])
+                edges = torch.cat([edges, e], dim = 0)
+            graph = self.graphs[layer].edge_subgraph(edges, preserve_nodes=True)
+            graph.ndata['node_type_embeddings'] = self.node_type_embeddings[:, layer, :]
+            sub_graphs.append(graph)
+            
         node_embed = self.node_embeddings
-        for i in range(len(graphs)):
-            graph = graphs[i]
+        
+        node_type_embed = []
+        for layer in range(self.edge_type_count):
+            graph = sub_graphs[layer]
             graph.update_all(fn.copy_src('node_type_embeddings', 'm'), fn.sum('m', 'neigh'))
-            trans_w = self.trans_weights[i]
-            trans_w_s1 = self.trans_weights_s1[i]
-            trans_w_s2 = self.trans_weights_s2[i]
-            graph.ndata['attention'] = torch.matmul(torch.tanh(torch.matmul(
-                graph.ndata['neigh'], trans_w_s1)), trans_w_s2)
+            node_type_embed.append(graph.ndata['neigh'][train_inputs])
+        node_type_embed = torch.stack(node_type_embed, 1)  # batch, layers, 10
         
-        attn = F.softmax(torch.cat([g.ndata['attention'] for g in graphs], dim=1), dim=1).unsqueeze(1)
-#         print(attn.shape)
-        node_type_embed = torch.cat([g.ndata['neigh'].unsqueeze(1) for g in graphs], dim=1)
+        # [batch_size, embedding_u_size10, embedding_size200]
+        trans_w = self.trans_weights[train_types]
+        # [batch_size, embedding_u_size10, dim_a20]
+        trans_w_s1 = self.trans_weights_s1[train_types]
+        # [batch_size, dim_a20, 1]
+        trans_w_s2 = self.trans_weights_s2[train_types]
         
-        node_type_embed = torch.matmul(attn, node_type_embed)
-        node_embed = node_embed + torch.matmul(node_type_embed, trans_w).squeeze(1)
+        attention = F.softmax(
+            torch.matmul(
+                torch.tanh(torch.matmul(node_type_embed, trans_w_s1)), trans_w_s2
+            ).squeeze(2),
+            dim=1,
+        ).unsqueeze(1)
+                
+        node_type_embed = torch.matmul(attention, node_type_embed)
+        node_embed = node_embed[train_inputs] + torch.matmul(node_type_embed, trans_w).squeeze(1)
         last_node_embed = F.normalize(node_embed, dim=1)
         
         return last_node_embed
@@ -184,11 +187,11 @@ class GATNEModel(nn.Module):
         # node_type_embed[i][j][k]: in layer j, the sum of all neighbors of k, which is one of the neighbors of i
         node_type_embed = torch.sum(node_embed_tmp, dim=2)
 
-        # [embedding_u_size10, embedding_size200]
+        # [batch_size, embedding_u_size10, embedding_size200]
         trans_w = self.trans_weights[train_types]
-        # [embedding_u_size10, dim_a20]
+        # [batch_size, embedding_u_size10, dim_a20]
         trans_w_s1 = self.trans_weights_s1[train_types]
-        # [dim_a20, 1]
+        # [batch_size, dim_a20, 1]
         trans_w_s2 = self.trans_weights_s2[train_types]
 
         attention = F.softmax(
@@ -317,46 +320,45 @@ def train_model(network_data):
     patience = 0
     for epoch in range(epochs):
         random.shuffle(train_pairs)
-        # batches = get_batches(train_pairs, neighbors, batch_size)  # 7066 batches
-        data = get_batches(train_pairs, neighbors)
+        batches = get_batches(train_pairs, neighbors, batch_size)  # 7066 batches
+        # data = get_batches(train_pairs, neighbors)
 
-        # data_iter = tqdm.tqdm(
-        #     batches,
-        #     desc="epoch %d" % (epoch),
-        #     total=(len(train_pairs) + (batch_size - 1)) // batch_size,
-        #     bar_format="{l_bar}{r_bar}",
-        # )
+        data_iter = tqdm.tqdm(
+            batches,
+            desc="epoch %d" % (epoch),
+            total=(len(train_pairs) + (batch_size - 1)) // batch_size,
+            bar_format="{l_bar}{r_bar}",
+        )
         avg_loss = 0.0
 
-        optimizer.zero_grad()
-        embs = model(data[0].to(device), data[2].to(device), data[3].to(device))
-        loss = nsloss(data[0].to(device), embs[data[0]], data[1].to(device))
-        loss.backward()
-        optimizer.step()
+        # optimizer.zero_grad()
+        # embs = model(data[0].to(device), data[2].to(device), data[3].to(device))
+        # loss = nsloss(data[0].to(device), embs[data[0]], data[1].to(device))
+        # loss.backward()
+        # optimizer.step()
 
-        avg_loss += loss.item()
-        print("epoch: ", epoch, "avg_loss:", avg_loss, "loss:", loss.item())
+        # avg_loss += loss.item()
 
-        # for i, data in enumerate(data_iter):
-        #     # batch by batch, 7066 batches in total
-        #     optimizer.zero_grad()
-        #     # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10
-        #     # embs: [batch_size64, embedding_size200]
-        #     embs = model(data[0].to(device), data[2].to(device), data[3].to(device))
-        #     loss = nsloss(data[0].to(device), embs, data[1].to(device))
-        #     loss.backward()
-        #     optimizer.step()
+        for i, data in enumerate(data_iter):
+            # batch by batch, 7066 batches in total
+            optimizer.zero_grad()
+            # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10
+            # embs: [batch_size64, embedding_size200]
+            embs = model(data[0].to(device), data[2].to(device), data[3].to(device))
+            loss = nsloss(data[0].to(device), embs, data[1].to(device))
+            loss.backward()
+            optimizer.step()
 
-        #     avg_loss += loss.item()
+            avg_loss += loss.item()
 
-        #     if i % 5000 == 0:
-        #         post_fix = {
-        #             "epoch": epoch,
-        #             "iter": i,
-        #             "avg_loss": avg_loss / (i + 1),
-        #             "loss": loss.item(),
-        #         }
-        #         data_iter.write(str(post_fix))
+            if i % 5000 == 0:
+                post_fix = {
+                    "epoch": epoch,
+                    "iter": i,
+                    "avg_loss": avg_loss / (i + 1),
+                    "loss": loss.item(),
+                }
+                data_iter.write(str(post_fix))
 
         # {'1': {}, '2': {}}
         final_model = dict(zip(edge_types, [dict() for _ in range(edge_type_count)]))
@@ -366,7 +368,7 @@ def train_model(network_data):
             node_neigh = torch.tensor(
                 [neighbors[i] for _ in range(edge_type_count)]  # [2, 2, 10]
             ).to(device)
-            node_emb = model(train_inputs, train_types, node_neigh, subgraph=True) #[2, 200]
+            node_emb = model(train_inputs, train_types, node_neigh) #[2, 200]
             for j in range(edge_type_count):
                 final_model[edge_types[j]][index2word[i]] = (
                     node_emb[j].cpu().detach().numpy()

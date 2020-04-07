@@ -303,7 +303,7 @@ def train_model(network_data):
         )
         avg_loss = 0.0
 
-        for i, (block, block_pair) in enumerate(train_dataloader):
+        for i, (block, block_pair) in enumerate(data_iter):
             # batch by batch, 7066 batches in total
             optimizer.zero_grad()
             # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10

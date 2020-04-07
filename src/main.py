@@ -112,7 +112,7 @@ class DGLGATNE(nn.Module):
         input_nodes = block.srcdata[dgl.NID]
         output_nodes = block.dstdata[dgl.NID]
         batch_size = block.number_of_dst_nodes('user')
-        node_embed = self.node_embeddings  # 64, 200
+        node_embed = self.node_embeddings  # 511, 200
         node_type_embed = []
 
         with block.local_scope():
@@ -125,10 +125,12 @@ class DGLGATNE(nn.Module):
         
             node_type_embed = torch.stack(node_type_embed, 1)  # 64, 2, 10
             tmp_node_type_embed = node_type_embed.unsqueeze(2).view(-1, 1, self.embedding_u_size)  # batch*2, 1, 10
-            trans_w = self.trans_weights.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(-1, self.embedding_u_size, self.embedding_size)
-            # [batch_size, type_counts2, embedding_u_size10, dim_a20]
-            trans_w_s1 = self.trans_weights_s1.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(-1, self.embedding_u_size, self.dim_a)
-            # [batch_size, dim_a20, 1]
+            trans_w = self.trans_weights.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(
+                -1, self.embedding_u_size, self.embedding_size
+            )
+            trans_w_s1 = self.trans_weights_s1.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(
+                -1, self.embedding_u_size, self.dim_a
+            )
             trans_w_s2 = self.trans_weights_s2.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(-1, self.dim_a, 1)
 
             attention = F.softmax(
@@ -141,7 +143,8 @@ class DGLGATNE(nn.Module):
             # 64*edge_type_count2, 1, 10
             node_type_embed = torch.matmul(attention, node_type_embed).view(-1, 1, self.embedding_u_size) 
             # 64, 2, 200
-            node_embed = node_embed[output_nodes].repeat(1, self.edge_type_count, 1) + torch.matmul(node_type_embed, trans_w).view(-1, self.edge_type_count, self.embedding_size)
+            node_embed = node_embed[output_nodes].unsqueeze(1).repeat(1, self.edge_type_count, 1) + \
+                torch.matmul(node_type_embed, trans_w).view(-1, self.edge_type_count, self.embedding_size)
             last_node_embed = F.normalize(node_embed, dim=2)
         
             return last_node_embed  # [batch_size64, edge_type_count2, embedding_size200]
@@ -309,7 +312,9 @@ def train_model(network_data):
             # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10
             # embs: [batch_size64, edge_type_count2, embedding_size200]
             embs = model(block[0].to(device))
-            loss = nsloss(block[0].dstdata[dgl.NID].to(device), embs[:,block_type,:], block_pair.to(device))
+            block_type = block_type.to(device)
+            embs = embs.gather(1, block_type.view(-1, 1, 1).expand(embs.shape[0], 1, embs.shape[2]))[:, 0]
+            loss = nsloss(block[0].dstdata[dgl.NID].to(device), embs, block_pair.to(device))
             loss.backward()
             optimizer.step()
 

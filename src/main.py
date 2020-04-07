@@ -63,10 +63,12 @@ class NeighborSampler(object):
     def sample(self, pairs):
         seeds = []
         seed_pair = []
+        seed_type = []
         for pair in pairs:
             if pair[0] not in seeds:
                 seeds.append(pair[0])
                 seed_pair.append(pair[1])
+                seed_type.append(pair[2])
         seeds = torch.LongTensor(seeds)
         # seeds, order = torch.unique(torch.LongTensor(seeds), sorted=True, return_inverse=True)
         blocks = []
@@ -76,7 +78,7 @@ class NeighborSampler(object):
             seeds = sampled_block.srcdata[dgl.NID]
             blocks.insert(0, sampled_block)
         # print()
-        return blocks, torch.LongTensor(seed_pair)
+        return blocks, torch.LongTensor(seed_pair), torch.LongTensor(seed_type)
 
 
 class DGLGATNE(nn.Module):
@@ -91,13 +93,9 @@ class DGLGATNE(nn.Module):
 
         self.node_embeddings = Parameter(torch.FloatTensor(num_nodes, embedding_size))
         # edge embedding, 511 * 2 * 10
-        self.node_type_embeddings = Parameter(  
-            torch.FloatTensor(num_nodes, edge_type_count, embedding_u_size)
-        )
-        self.trans_weights = Parameter(torch.FloatTensor(embedding_u_size, embedding_size))
-        self.trans_weights_s1 = Parameter(
-            torch.FloatTensor(edge_type_count, embedding_u_size, dim_a)
-        )
+        self.node_type_embeddings = Parameter(torch.FloatTensor(num_nodes, edge_type_count, embedding_u_size))
+        self.trans_weights = Parameter(torch.FloatTensor(edge_type_count, embedding_u_size, embedding_size))
+        self.trans_weights_s1 = Parameter(torch.FloatTensor(edge_type_count, embedding_u_size, dim_a))
         self.trans_weights_s2 = Parameter(torch.FloatTensor(edge_type_count, dim_a, 1))
 
         self.reset_parameters()
@@ -114,7 +112,7 @@ class DGLGATNE(nn.Module):
         input_nodes = block.srcdata[dgl.NID]
         output_nodes = block.dstdata[dgl.NID]
         batch_size = block.number_of_dst_nodes('user')
-        node_embed = self.node_embeddings
+        node_embed = self.node_embeddings  # 64, 200
         node_type_embed = []
 
         with block.local_scope():
@@ -127,24 +125,26 @@ class DGLGATNE(nn.Module):
         
             node_type_embed = torch.stack(node_type_embed, 1)  # 64, 2, 10
             tmp_node_type_embed = node_type_embed.unsqueeze(2).view(-1, 1, self.embedding_u_size)  # batch*2, 1, 10
-            trans_w = self.trans_weights  # .repeat(batch_size, 1, 1, 1).view(-1, self.embedding_u_size, self.embedding_size)
+            trans_w = self.trans_weights.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(-1, self.embedding_u_size, self.embedding_size)
             # [batch_size, type_counts2, embedding_u_size10, dim_a20]
-            trans_w_s1 = self.trans_weights_s1.repeat(batch_size, 1, 1, 1).view(-1, self.embedding_u_size, self.dim_a)
+            trans_w_s1 = self.trans_weights_s1.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(-1, self.embedding_u_size, self.dim_a)
             # [batch_size, dim_a20, 1]
-            trans_w_s2 = self.trans_weights_s2.repeat(batch_size, 1, 1, 1).view(-1, self.dim_a, 1)
+            trans_w_s2 = self.trans_weights_s2.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(-1, self.dim_a, 1)
 
             attention = F.softmax(
                 torch.matmul(
                     torch.tanh(torch.matmul(tmp_node_type_embed, trans_w_s1)), trans_w_s2
                 ).squeeze(2).view(-1, self.edge_type_count),
                 dim=1,
-            ).unsqueeze(1)  # 64,1,2
-                
-            node_type_embed = torch.matmul(attention, node_type_embed).squeeze(1)  # 64, 10
-            node_embed = node_embed[output_nodes] + torch.matmul(node_type_embed, trans_w)
-            last_node_embed = F.normalize(node_embed, dim=1)
+            ).unsqueeze(1).repeat(1, self.edge_type_count, 1)  # 64,edge_type_count2,2
+            
+            # 64*edge_type_count2, 1, 10
+            node_type_embed = torch.matmul(attention, node_type_embed).view(-1, 1, self.embedding_u_size) 
+            # 64, 2, 200
+            node_embed = node_embed[output_nodes].repeat(1, self.edge_type_count, 1) + torch.matmul(node_type_embed, trans_w).view(-1, self.edge_type_count, self.embedding_size)
+            last_node_embed = F.normalize(node_embed, dim=2)
         
-            return last_node_embed
+            return last_node_embed  # [batch_size64, edge_type_count2, embedding_size200]
 
     def inference(self, train_inputs, train_types, node_neigh):
         #                batch_size, batch_size, batch_size * 2 * 10
@@ -162,7 +162,7 @@ class DGLGATNE(nn.Module):
         # [batch_size, 2, embedding_u_size10]: the sum of each node's all neighbors
         node_type_embed = torch.sum(node_embed_tmp, dim=2)
         # [batch_size, embedding_u_size10, embedding_size200]
-        trans_w = self.trans_weights
+        trans_w = self.trans_weights[train_types]
         # [batch_size, embedding_u_size10, dim_a20]
         trans_w_s1 = self.trans_weights_s1[train_types]
         # [batch_size, dim_a20, 1]
@@ -303,13 +303,13 @@ def train_model(network_data):
         )
         avg_loss = 0.0
 
-        for i, (block, block_pair) in enumerate(data_iter):
+        for i, (block, block_pair, block_type) in enumerate(data_iter):
             # batch by batch, 7066 batches in total
             optimizer.zero_grad()
             # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10
-            # embs: [batch_size64, embedding_size200]
+            # embs: [batch_size64, edge_type_count2, embedding_size200]
             embs = model(block[0].to(device))
-            loss = nsloss(block[0].dstdata[dgl.NID].to(device), embs, block_pair.to(device))
+            loss = nsloss(block[0].dstdata[dgl.NID].to(device), embs[:,block_type,:], block_pair.to(device))
             loss.backward()
             optimizer.step()
 
@@ -395,9 +395,11 @@ if __name__ == "__main__":
     testing_true_data_by_edge, testing_false_data_by_edge = load_testing_data(
         file_name + "/test.txt"
     )
-
+    start = time.time()
     average_auc, average_f1, average_pr = train_model(training_data_by_type)
+    end = time.time()
 
     print("Overall ROC-AUC:", average_auc)
     print("Overall PR-AUC", average_pr)
     print("Overall F1:", average_f1)
+    print("Training Time", end-start)

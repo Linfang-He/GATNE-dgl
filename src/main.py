@@ -177,8 +177,8 @@ class DGLGATNE(nn.Module):
             ).squeeze(2),
             dim=1,
         ).unsqueeze(1)  # [batch_size64, 1, layers2]
-        node_type_embed = torch.matmul(attention, node_type_embed).squeeze(1)  # [64, embedding_u_size10]
-        node_embed = node_embed + torch.matmul(node_type_embed, trans_w)  # [64, 200]
+        node_type_embed = torch.matmul(attention, node_type_embed)  # [64, 1, embedding_u_size10]
+        node_embed = node_embed + torch.matmul(node_type_embed, trans_w).squeeze(1)  # [64, 200]
         last_node_embed = F.normalize(node_embed, dim=1)
 
         return last_node_embed  # [batch_size64, embedding_size200]

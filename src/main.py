@@ -61,24 +61,16 @@ class NeighborSampler(object):
         self.num_fanouts = num_fanouts
         
     def sample(self, pairs):
-        seeds = []
-        seed_pair = []
-        seed_type = []
-        for pair in pairs:
-            if pair[0] not in seeds:
-                seeds.append(pair[0])
-                seed_pair.append(pair[1])
-                seed_type.append(pair[2])
-        seeds = torch.LongTensor(seeds)
-        # seeds, order = torch.unique(torch.LongTensor(seeds), sorted=True, return_inverse=True)
+        heads, tails, types = zip(*pairs)
+        seeds, head_invmap = torch.unique(torch.LongTensor(heads), return_inverse=True)
         blocks = []
         for fanout in reversed(self.num_fanouts):
             sampled_graph = dgl.sampling.sample_neighbors(self.g, seeds, fanout)
             sampled_block = dgl.to_block(sampled_graph, seeds)
             seeds = sampled_block.srcdata[dgl.NID]
             blocks.insert(0, sampled_block)
-        # print()
-        return blocks, torch.LongTensor(seed_pair), torch.LongTensor(seed_type)
+        return blocks, torch.LongTensor(head_invmap), torch.LongTensor(tails), torch.LongTensor(types)
+
 
 
 class DGLGATNE(nn.Module):
@@ -118,7 +110,8 @@ class DGLGATNE(nn.Module):
         with block.local_scope():
             for i in range(self.edge_type_count):
                 edge_type = self.edge_types[i]
-                block.nodes['user'].data[edge_type] = self.node_type_embeddings[input_nodes, i]
+                block.srcnodes['user'].data[edge_type] = self.node_type_embeddings[input_nodes, i]
+                block.dstnodes['user'].data[edge_type] = self.node_type_embeddings[output_nodes, i]
                 block.update_all(fn.copy_u(edge_type, 'm'), fn.sum('m', edge_type), etype=edge_type)
                 # print(block.nodes['user'].data[edge_type+'neigh'])
                 node_type_embed.append(block.dstnodes['user'].data[edge_type])
@@ -148,41 +141,6 @@ class DGLGATNE(nn.Module):
             last_node_embed = F.normalize(node_embed, dim=2)
         
             return last_node_embed  # [batch_size64, edge_type_count2, embedding_size200]
-
-    def inference(self, train_inputs, train_types, node_neigh):
-        #                batch_size, batch_size, batch_size * 2 * 10
-        node_embed = self.node_embeddings[train_inputs]  # batch_size64 * embedding_size200
-        # neighbors' neighbors: [batch_size, layers2, neighbor-samples10, layers2, embedding_u_size10]
-        node_embed_neighbors = self.node_type_embeddings[node_neigh]
-        # [batch_size, 2, neighbor-samples, embedding_u_size]
-        node_embed_tmp = torch.cat(
-            [
-                node_embed_neighbors[:, i, :, i, :].unsqueeze(1)
-                for i in range(self.edge_type_count)
-            ],
-            dim=1,
-        )
-        # [batch_size, 2, embedding_u_size10]: the sum of each node's all neighbors
-        node_type_embed = torch.sum(node_embed_tmp, dim=2)
-        # [batch_size, embedding_u_size10, embedding_size200]
-        trans_w = self.trans_weights[train_types]
-        # [batch_size, embedding_u_size10, dim_a20]
-        trans_w_s1 = self.trans_weights_s1[train_types]
-        # [batch_size, dim_a20, 1]
-        trans_w_s2 = self.trans_weights_s2[train_types]
-
-        attention = F.softmax(
-            torch.matmul(
-                torch.tanh(torch.matmul(node_type_embed, trans_w_s1)), trans_w_s2
-            ).squeeze(2),
-            dim=1,
-        ).unsqueeze(1)  # [batch_size64, 1, layers2]
-        node_type_embed = torch.matmul(attention, node_type_embed)  # [64, 1, embedding_u_size10]
-        node_embed = node_embed + torch.matmul(node_type_embed, trans_w).squeeze(1)  # [64, 200]
-        last_node_embed = F.normalize(node_embed, dim=1)
-
-        return last_node_embed  # [batch_size64, embedding_size200]
-
 
 class NSLoss(nn.Module):
     def __init__(self, num_nodes, num_sampled, embedding_size):
@@ -233,7 +191,6 @@ def train_model(network_data):
     vocab, index2word = generate_vocab(all_walks)
     # size: 452200, form: (node1, node2, layer_id)
     train_pairs = generate_pairs(all_walks, vocab, args.window_size)  
-
     edge_types = list(network_data.keys())  # 2
 
     num_nodes = len(index2word)  # 511
@@ -249,32 +206,6 @@ def train_model(network_data):
     neighbor_samples = args.neighbor_samples  # 10
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    # real neghbors (no skip), shape: [num_nodes=511, 2, 10]
-    neighbors = [[[] for __ in range(edge_type_count)] for _ in range(num_nodes)]  
-    for r in range(edge_type_count):
-        g = network_data[edge_types[r]]
-        for (x, y) in g:
-            ix = vocab[x].index
-            iy = vocab[y].index
-            neighbors[ix][r].append(iy)
-            neighbors[iy][r].append(ix)
-        for i in range(num_nodes):
-            if len(neighbors[i][r]) == 0:  # no neighbor
-                neighbors[i][r] = [i] * neighbor_samples  # regard itself as its neighbor
-            elif len(neighbors[i][r]) < neighbor_samples:  # randomly repeat neighbors to reach neighbor_samples
-                neighbors[i][r].extend(
-                    list(
-                        np.random.choice(
-                            neighbors[i][r],
-                            size=neighbor_samples - len(neighbors[i][r]),
-                        )
-                    )
-                )
-            elif len(neighbors[i][r]) > neighbor_samples:  # random pick 10 and remove others
-                neighbors[i][r] = list(
-                    np.random.choice(neighbors[i][r], size=neighbor_samples)
-                )
 
     g = get_graph(network_data, vocab)
     neighbor_sampler = NeighborSampler(g, [neighbor_samples])
@@ -295,8 +226,6 @@ def train_model(network_data):
     for epoch in range(epochs):
         model.train()
         random.shuffle(train_pairs)
-        # batches = get_batches(train_pairs, neighbors, batch_size)  # 7066 batches
-        # data = get_batches(train_pairs, neighbors)
 
         data_iter = tqdm.tqdm(
             train_dataloader,
@@ -306,18 +235,15 @@ def train_model(network_data):
         )
         avg_loss = 0.0
 
-        for i, (block, block_pair, block_type) in enumerate(data_iter):
-            # batch by batch, 7066 batches in total
+        for i, (block, head_invmap, tails, block_types) in enumerate(data_iter):
             optimizer.zero_grad()
-            # data: node1, node2, layer_id, 10 neighbors of node1. dimension: batch_size/batch_size*10
             # embs: [batch_size64, edge_type_count2, embedding_size200]
-            embs = model(block[0].to(device))
-            block_type = block_type.to(device)
-            embs = embs.gather(1, block_type.view(-1, 1, 1).expand(embs.shape[0], 1, embs.shape[2]))[:, 0]
-            loss = nsloss(block[0].dstdata[dgl.NID].to(device), embs, block_pair.to(device))
+            block_types = block_types.to(device)
+            embs = model(block[0].to(device))[head_invmap]
+            embs = embs.gather(1, block_types.view(-1, 1, 1).expand(embs.shape[0], 1, embs.shape[2]))[:, 0]
+            loss = nsloss(block[0].dstdata[dgl.NID][head_invmap].to(device), embs, tails.to(device))
             loss.backward()
             optimizer.step()
-
             avg_loss += loss.item()
 
             if i % 5000 == 0:
@@ -335,11 +261,13 @@ def train_model(network_data):
         for i in range(num_nodes):
             train_inputs = torch.tensor([i for _ in range(edge_type_count)]).to(device)  # [i, i]
             train_types = torch.tensor(list(range(edge_type_count))).to(device)  # [0, 1]
-            node_neigh = torch.tensor(
-                [neighbors[i] for _ in range(edge_type_count)]  # [2, 2, 10]
-            ).to(device)
+            pairs = torch.cat((train_inputs, train_inputs, train_types), dim=1)  # (2, 3)
+            train_blocks, train_invmap, fake_tails, train_types = neighbor_sampler.sample(pairs)
 
-            node_emb = model.inference(train_inputs, train_types, node_neigh) #[2, 200]
+            node_emb = model(train_blocks[0].to(device))[train_invmap] #[2, 2, 200]
+            node_emb = node_emb.gather(1, train_types.view(-1, 1, 1
+                ).expand(node_emb.shape[0], 1, node_emb.shape[2])
+            )[:, 0]
 
             for j in range(edge_type_count):
                 final_model[edge_types[j]][index2word[i]] = (

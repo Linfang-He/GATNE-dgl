@@ -33,25 +33,6 @@ def get_graph(network_data, vocab):
     return graph
 
 
-# train_pairs: size: 452200, form: (node1, node2, layer_id)
-# neighbors: [num_nodes=511, 2, 10]
-
-def get_batches(pairs, neighbors, batch_size):
-    n_batches = (len(pairs) + (batch_size - 1)) // batch_size
-
-    for idx in range(n_batches):
-        x, y, t, neigh = [], [], [], []
-        for i in range(batch_size):
-            index = idx * batch_size + i
-            if index >= len(pairs):
-                break
-            x.append(pairs[index][0])
-            y.append(pairs[index][1])
-            t.append(pairs[index][2])
-            neigh.append(neighbors[pairs[index][0]])
-        yield torch.tensor(x), torch.tensor(y), torch.tensor(t), torch.tensor(neigh)
-
-
 class NeighborSampler(object):
     def __init__(self, g, num_fanouts):
         """
@@ -70,7 +51,6 @@ class NeighborSampler(object):
             seeds = sampled_block.srcdata[dgl.NID]
             blocks.insert(0, sampled_block)
         return blocks, torch.LongTensor(head_invmap), torch.LongTensor(tails), torch.LongTensor(types)
-
 
 
 class DGLGATNE(nn.Module):
@@ -113,7 +93,6 @@ class DGLGATNE(nn.Module):
                 block.srcnodes['user'].data[edge_type] = self.node_type_embeddings[input_nodes, i]
                 block.dstnodes['user'].data[edge_type] = self.node_type_embeddings[output_nodes, i]
                 block.update_all(fn.copy_u(edge_type, 'm'), fn.sum('m', edge_type), etype=edge_type)
-                # print(block.nodes['user'].data[edge_type+'neigh'])
                 node_type_embed.append(block.dstnodes['user'].data[edge_type])
         
             node_type_embed = torch.stack(node_type_embed, 1)  # 64, 2, 10
@@ -141,6 +120,7 @@ class DGLGATNE(nn.Module):
             last_node_embed = F.normalize(node_embed, dim=2)
         
             return last_node_embed  # [batch_size64, edge_type_count2, embedding_size200]
+
 
 class NSLoss(nn.Module):
     def __init__(self, num_nodes, num_sampled, embedding_size):
@@ -217,9 +197,7 @@ def train_model(network_data):
     model.to(device)
     nsloss.to(device)
 
-    optimizer = torch.optim.Adam(
-        [{"params": model.parameters()}, {"params": nsloss.parameters()}], lr=1e-4
-    )
+    optimizer = torch.optim.Adam([{"params": model.parameters()}, {"params": nsloss.parameters()}], lr=1e-4)
 
     best_score = 0
     patience = 0
